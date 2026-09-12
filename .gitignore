@@ -1,0 +1,15 @@
+node_modules/
+.next/
+.next-dev/
+.next-production/
+out/
+.env*
+!.env.example
+*.tsbuildinfo
+playwright-report/
+test-results/
+coverage/
+.vercel/
+*.log
+*.cpuprofile
+artifacts/

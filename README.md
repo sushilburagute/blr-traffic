@@ -143,8 +143,9 @@ Live rain and incident changes are recorded as fixed-tick `liveEvents` in shared
 Reports finished early preserve their endpoint using `until` in result links; replay and deep comparisons
 stop at the same simulation time. Expert JSON editors expose less common fields alongside the sliders.
 
-This is an educational simulator. It is not calibrated to measured ORR demand, signal plans, or trip times.
-The current default rush-hour demand is 12,000 vehicles/hour, replacing the plan's initial 7,000 starting point.
+This is an educational simulator. It is not calibrated to measured ORR demand or signal plans.
+The default rush-hour demand is 13,000 vehicles/hour at a 50 km/h speed limit, calibrated so trip times match
+public estimates (see Calibration in the implementation notes); signal plans remain assumptions.
 U-turns add a return trip for an assumed 5% of eligible exiting vehicles plus local merge friction;
 turning trajectories and route-choice calibration remain modelling assumptions.
 See [implementation notes](plan/implementation-notes.md) for plan deviations and verification status.

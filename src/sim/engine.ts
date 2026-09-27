@@ -1,4 +1,4 @@
-import { loadNetwork } from './network';
+import { loadNetwork, projectOffset, offsetAt } from './network';
 import { validateScenarioNetwork } from './network/validate';
 import { RNG } from './rng';
 import { Vehicles, LANES_PER_SEGMENT } from './vehicles';
@@ -21,10 +21,47 @@ import {
   type ScenarioConfig,
   type Disruption,
   type ObstacleSpec,
+  type EncroachmentSpec,
 } from './types';
 export const DT = 0.1;
 /** How far past a flyover's split point a through vehicle keeps trying to get onto the ramp. */
 const FLYOVER_WINDOW_M = 60;
+/** Hardest physically plausible braking, m/s² (IDM is clamped to the same value). */
+const B_MAX = 8.5;
+/** A bus stops changing lanes (other than toward the kerb) this far before a stop it will serve. */
+const BUS_STOP_APPROACH_M = 400;
+/** Lane-change cooldown while a bus works its way to the kerb (s). */
+const BUS_PULL_COOLDOWN_S = 1;
+/** Within this distance of its stop a bus still outside the kerb lane serves the stop from the next lane. */
+const BUS_FALLBACK_M = 30;
+/** How far ahead of a segment's end a vehicle looks into the next segment for its leader. */
+const LOOKAHEAD_M = 250;
+/** Per-step relaxation of the drawn lateral position toward the lane (τ = 0.6 s two-wheelers, 0.8 s others). */
+const LATERAL_RELAX = TYPE_PARAMS.map((_, t) => 1 - Math.exp(-DT / (t === 0 ? 0.6 : 0.8)));
+/**
+ * Drawn lateral speed limits (m/s) and lateral acceleration limit (m/s²), so a lane change eases in rather
+ * than starting at full lateral speed (the drawn heading follows the lateral speed).
+ */
+const LATERAL_SPEED = TYPE_PARAMS.map((_, t) => (t === 0 ? 2 : 1.5)),
+  LATERAL_ACCEL = 3;
+/**
+ * A vehicle can only move sideways by steering while it rolls forward: lateral speed is also capped at
+ * a creep speed plus a steering angle's share of forward speed, so near-stationary vehicles edge across
+ * slowly instead of sliding sideways (two-wheelers lean in more sharply).
+ */
+const LATERAL_CREEP = 0.4,
+  LATERAL_STEER = TYPE_PARAMS.map((_, t) => (t === 0 ? 0.45 : 0.25));
+/** No leader in range: gap reported to IDM. */
+const FREE_GAP = 10000;
+/**
+ * Right of way where feeders merge. A flyover landing and the at-grade road rejoin zip-fashion: neither gives
+ * way, because at-grade traffic released by the signal forces its way in alongside the landing traffic, as it
+ * does on the ORR (see plan/implementation-notes.md, Calibration). On-ramps give way to both.
+ */
+const MERGE_PRIORITY = { flyover: 1, main: 1, ramp: 0 } as const;
+/** Zip merge: spacing to a vehicle on the other feeder is relaxed by MERGE_EASE per metre beyond MERGE_EASE_M. */
+const MERGE_EASE = 0.3,
+  MERGE_EASE_M = 20;
 interface Arrival {
   type: number;
   profile: number;
@@ -33,6 +70,11 @@ interface Arrival {
   roll: number;
   bus: boolean;
   turned?: boolean;
+}
+interface Constraint {
+  cap: number;
+  stop: number;
+  pressure: number;
 }
 export function createEngine(network: NetworkData, config: ScenarioConfig) {
   return new Engine(network, config);
@@ -73,6 +115,38 @@ export class Engine {
   private nextIncidentTick = 0;
   private readonly nextGap: Float32Array;
   private readonly nextDV: Float32Array;
+  /** Per segment, per obstacle: bit mask of the lanes it covers. */
+  private readonly obstacleLaneMask: Uint32Array[];
+  private readonly encroachmentBySegment: EncroachmentSpec[][];
+  /** Per segment: indices into `config.infra.busStops`. */
+  private readonly busStopsBySegment: number[][];
+  /** Junction index of each segment's downstream end. */
+  private readonly toJunctionIndex: Int16Array;
+  /** Segments whose kerb lane floods in heavy rain (Iblur / Bellandur approaches). */
+  private readonly floodProne: Uint8Array;
+  /** Segments that have a flyover bypass (candidates for transferToFlyovers). */
+  private readonly bypassed: number[];
+  /** Perception delay (ticks) per behaviour profile. */
+  private readonly profileDelay: Int32Array;
+  /** Scratch constraint results, reused every call to avoid allocation. */
+  private readonly current: Constraint = { cap: 0, stop: 0, pressure: 0 };
+  private readonly target: Constraint = { cap: 0, stop: 0, pressure: 0 };
+  private readonly transferCandidates: number[] = [];
+  /** Fixed lane width per segment (widthM / physical lanes); squeeze never re-lays the road out. */
+  private readonly laneWidth: Float32Array;
+  /** Per segment: the segments (main, flyover, ramp) that flow into it. */
+  private readonly feeders: number[][];
+  /** Per segment: 1 when a higher-priority feeder joins the same downstream segment. */
+  private readonly yields: Uint8Array;
+  /** Speed of the leader found by the last `gapAhead` call (own speed when there is none). */
+  private aheadSpeed = 0;
+  /** Relative speed to whatever bounds the gap returned by the last `perceive` call. */
+  private perceivedDV = 0;
+  /** Whether the gap returned by the last `perceive` call is to a vehicle beyond the segment end. */
+  private perceivedAhead = false;
+  /** Per vehicle: this step's gap is to a vehicle beyond the segment end (see integration). */
+  private readonly gapIsAhead: Uint8Array;
+  private readonly point = new Float64Array(3);
   constructor(
     readonly network: NetworkData,
     config: ScenarioConfig,
@@ -122,6 +196,41 @@ export class Engine {
     this.brokenGate = new Uint8Array(network.junctions.length);
     this.nextGap = new Float32Array(this.vehicles.capacity);
     this.nextDV = new Float32Array(this.vehicles.capacity);
+    this.gapIsAhead = new Uint8Array(this.vehicles.capacity);
+    this.obstacleLaneMask = this.obstacleBySegment.map((list) =>
+      Uint32Array.from(list, (o) => o.lanes.reduce((m, l) => m | (1 << l), 0)),
+    );
+    this.encroachmentBySegment = network.segments.map((s) =>
+      this.config.infra.encroachment.filter((e) => e.segmentId === s.id),
+    );
+    this.busStopsBySegment = network.segments.map(() => []);
+    this.config.infra.busStops.forEach((b, i) =>
+      this.busStopsBySegment[this.graph.byId.get(b.segmentId)!].push(i),
+    );
+    this.toJunctionIndex = Int16Array.from(network.segments, (s) =>
+      network.junctions.findIndex((j) => j.id === s.toJunction),
+    );
+    this.floodProne = Uint8Array.from(network.segments, (s) =>
+      Number(s.kind === 'main' && (s.toJunction === 'iblur' || s.toJunction === 'bellandur')),
+    );
+    this.bypassed = [];
+    for (let i = 0; i < network.segments.length; i++)
+      if (this.bypasses[i] >= 0) this.bypassed.push(i);
+    this.profileDelay = Int32Array.from(this.profiles, (b) =>
+      Math.min(10, Math.round(b.reactionTime / DT)),
+    );
+    this.laneWidth = Float32Array.from(network.segments, (s, i) => s.widthM / this.lanes[i]);
+    this.feeders = network.segments.map(() => []);
+    for (let i = 0; i < network.segments.length; i++)
+      if (this.next[i] >= 0) this.feeders[this.next[i]].push(i);
+    this.yields = Uint8Array.from(network.segments, (s, i) =>
+      Number(
+        this.next[i] >= 0 &&
+          this.feeders[this.next[i]].some(
+            (f) => MERGE_PRIORITY[network.segments[f].kind] > MERGE_PRIORITY[s.kind],
+          ),
+      ),
+    );
     this.stats.events.push(
       ...config.disruptions.map((d) => ({ simTime: d.startMin * 60, label: d.type })),
     );
@@ -159,6 +268,181 @@ export class Engine {
     const stats = this.stats.report(this.vehicles, this.time, this.unservedDemand, this.finished);
     stats.config = structuredClone(this.replayConfig);
     return stats;
+  }
+  /**
+   * Lateral offset (metres, positive to the right of travel) of a logical lane, fractional while filtering.
+   * Lane width is fixed, so the virtual squeeze lane (index `lanes`) sits on the shoulder beyond the kerb.
+   */
+  lateralTarget(segment: number, lane: number) {
+    return ((this.lanes[segment] - 1) / 2 - lane) * this.laneWidth[segment];
+  }
+  /** Lane a vehicle in `lane` of `seg` enters on `next`: ramps feed the kerb lane (highest index). */
+  private entryLane(id: number, seg: number, next: number, lane: number) {
+    const v = this.vehicles,
+      lanes = this.lanes[next];
+    let entry = this.network.segments[seg].kind === 'ramp' ? lanes - 1 : Math.min(lane, lanes - 1);
+    if (
+      !laneAllowed(v.type[id], entry, lanes, this.config.infra.busLane, Boolean(v.busAllowed[id]))
+    )
+      entry = Math.max(0, entry - 1);
+    return entry;
+  }
+  /**
+   * Gap to the first vehicle the given vehicle will meet beyond the end of `seg` in the lane it will enter
+   * (FREE_GAP when it leaves the network there or nothing is within LOOKAHEAD_M). Where a flyover and the
+   * at-grade road rejoin, the two feeders are merged zip-fashion: a vehicle on the other feeder that is
+   * closer to the merge point, heading for the same lane and not held by a signal counts as a leader.
+   */
+  private gapAhead(id: number, seg: number, lane: number, position: number) {
+    const v = this.vehicles,
+      length = this.network.segments[seg].lengthM,
+      next = this.next[seg],
+      toEnd = length - position;
+    this.aheadSpeed = v.v[id];
+    if (toEnd > LOOKAHEAD_M || next < 0 || v.exitJunction[id] === this.toJunctionIndex[seg])
+      return FREE_GAP;
+    const entry = this.entryLane(id, seg, next, lane);
+    const list = v.laneIndex[next * LANES_PER_SEGMENT + entry];
+    let gap = FREE_GAP;
+    if (list.length) {
+      const leader = list[0];
+      this.aheadSpeed = v.v[leader];
+      gap = toEnd + v.s[leader] - TYPE_PARAMS[v.type[leader]].length;
+    }
+    const priority = MERGE_PRIORITY[this.network.segments[seg].kind];
+    if (priority === 0) return gap;
+    const feeders = this.feeders[next];
+    for (let f = 0; f < feeders.length; f++) {
+      const up = feeders[f];
+      if (up === seg) continue;
+      const kind = this.network.segments[up].kind,
+        upLength = this.network.segments[up].lengthM,
+        signalled = kind === 'main' && this.signals[this.approaches[up]] !== 2;
+      for (let l = 0; l < 6; l++) {
+        const others = v.laneIndex[up * LANES_PER_SEGMENT + l];
+        if (!others.length || v.s[others[others.length - 1]] <= upLength - toEnd) continue;
+        v.locate(up, l, upLength - toEnd + 1e-3);
+        for (
+          let k = v.foundLeader < 0 ? others.length : v.lanePosition[v.foundLeader];
+          k < others.length;
+          k++
+        ) {
+          const u = others[k];
+          if (v.exitJunction[u] === this.toJunctionIndex[up]) continue;
+          if (signalled && !v.committed[u] && v.s[u] < upLength - 2) continue;
+          // A lower-priority vehicle waiting to give way is not merging yet.
+          if (MERGE_PRIORITY[kind] < priority && v.v[u] < 1) continue;
+          if (this.entryLane(u, up, next, l) !== entry) break;
+          // Far from the merge only a gentle adjustment is needed: the required spacing tightens to the
+          // real one over the last MERGE_EASE_M.
+          const g =
+            toEnd -
+            (upLength - v.s[u]) -
+            TYPE_PARAMS[v.type[u]].length +
+            MERGE_EASE * Math.max(0, toEnd - MERGE_EASE_M);
+          if (g < gap) {
+            gap = g;
+            this.aheadSpeed = v.v[u];
+          }
+          break;
+        }
+      }
+    }
+    return gap;
+  }
+  /** Current (undelayed) gap in the vehicle's own lane, bounded by the stop distance; sets perceivedDV. */
+  private perceive(id: number, stop: number) {
+    const v = this.vehicles,
+      leader = v.leader(id);
+    let gap: number, dv: number;
+    this.perceivedAhead = false;
+    if (leader >= 0) {
+      gap = v.gap(id, leader);
+      dv = v.v[id] - v.v[leader];
+    } else if (stop <= this.network.segments[v.segment[id]].lengthM - v.s[id]) {
+      // Stopping before the segment end anyway (signal, give-way, stop): whatever is beyond is irrelevant.
+      gap = FREE_GAP;
+      dv = 0;
+    } else {
+      gap = this.gapAhead(id, v.segment[id], v.lane[id], v.s[id]);
+      dv = v.v[id] - this.aheadSpeed;
+      this.perceivedAhead = gap < FREE_GAP;
+    }
+    if (stop <= gap) {
+      gap = stop;
+      dv = v.v[id];
+      this.perceivedAhead = false;
+    }
+    this.perceivedDV = dv;
+    return gap;
+  }
+  /**
+   * Signal state at a segment's stop line. Ramps are the cross-road entries at a junction: they turn in
+   * while the main approach into the same junction and direction is held on red, and wait otherwise.
+   */
+  private signalFor(seg: number): number {
+    const state = this.signals[this.approaches[seg]];
+    return this.network.segments[seg].kind === 'ramp' ? (state === 0 ? 2 : 0) : state;
+  }
+  /** Keeps the drawn position continuous when a vehicle moves from (seg, s) to (next, nextS). */
+  private carryLateral(id: number, seg: number, s: number, next: number, nextS: number) {
+    const v = this.vehicles,
+      p = this.point;
+    if (v.latM[id] !== v.latM[id]) return; // not drawn yet; initialised by the lateral update
+    projectOffset(this.network.segments[seg], v.latM[id], s, p);
+    v.latM[id] = offsetAt(this.network.segments[next], nextS, p[0], p[1]);
+  }
+  /**
+   * Stop distance for a vehicle that must give way where its segment merges into the next one (FREE_GAP
+   * when it may go): side-road ramps yield to the main road and flyover (which zip-merge with each other, see
+   * MERGE_PRIORITY), for vehicles about to pass the merge point in the lane it will join. A vehicle that can
+   * no longer stop comfortably keeps going.
+   */
+  private giveWay(id: number, seg: number, lane: number, position: number) {
+    const v = this.vehicles,
+      next = this.next[seg];
+    if (next < 0 || !this.yields[seg] || v.exitJunction[id] === this.toJunctionIndex[seg])
+      return FREE_GAP;
+    const priority = MERGE_PRIORITY[this.network.segments[seg].kind];
+    // A yielding at-grade road would wait at its stop line; a ramp waits at its end.
+    const dist = this.network.segments[seg].lengthM - (priority === 1 ? 2 : 0) - position,
+      type = TYPE_PARAMS[v.type[id]];
+    if (dist <= 0 || v.v[id] * v.v[id] > type.b * Math.max(0, dist - 0.3)) return FREE_GAP;
+    const entry = this.entryLane(id, seg, next, lane),
+      last = this.lanes[next] - 1;
+    for (const up of this.feeders[next]) {
+      const upSegment = this.network.segments[up];
+      if (MERGE_PRIORITY[upSegment.kind] <= priority) continue;
+      const held = upSegment.kind === 'main' && this.signals[this.approaches[up]] !== 2;
+      for (let l = 0; l < 6; l++) {
+        if (Math.min(l, last) !== entry) continue;
+        const list = v.laneIndex[up * LANES_PER_SEGMENT + l];
+        for (let k = list.length - 1; k >= 0; k--) {
+          const u = list[k],
+            toMerge = upSegment.lengthM - v.s[u];
+          if (toMerge > 5 + (2.5 * upSegment.speedLimitKmh) / 3.6) break;
+          if (v.exitJunction[u] === this.toJunctionIndex[up]) continue;
+          if (held && !v.committed[u] && toMerge > 2) break;
+          if (toMerge < 5 + 2.5 * v.v[u]) return dist;
+        }
+      }
+    }
+    return FREE_GAP;
+  }
+  /** A bus approaching (within BUS_STOP_APPROACH_M) or dwelling at a stop it has not yet served. */
+  private servingStop(id: number) {
+    const v = this.vehicles;
+    if (v.type[id] !== 4) return false;
+    if (v.dwellUntil[id] > 0) return true;
+    const stops = this.busStopsBySegment[v.segment[id]],
+      position = v.s[id];
+    for (let k = 0; k < stops.length; k++) {
+      const i = stops[k],
+        b = this.config.infra.busStops[i];
+      if (v.servedStop[id] !== i && position <= b.s + 5 && b.s - position < BUS_STOP_APPROACH_M)
+        return true;
+    }
+    return false;
   }
   private demand() {
     const minute = Math.min(this.rates.length - 1, Math.floor(this.time / 60)),
@@ -260,6 +544,7 @@ export class Engine {
       const id = v.spawn(seg, best, arrival.type, arrival.profile, this.time);
       if (id < 0) return;
       v.v[id] = entrySpeed;
+      v.latM[id] = this.lateralTarget(seg, best);
       v.gapHistory.fill(bestGap, id * 11, id * 11 + 11);
       v.exitJunction[id] = arrival.exit;
       v.through[id] = Number(arrival.through);
@@ -287,8 +572,8 @@ export class Engine {
           if (v.profile[id] !== 0) cutters++;
         }
       let width = this.lanes[i] * 3.5;
-      for (const e of this.config.infra.encroachment)
-        if (e.segmentId === s.id) width -= (e.widthReductionM * e.lengthM) / s.lengthM;
+      for (const e of this.encroachmentBySegment[i])
+        width -= (e.widthReductionM * e.lengthM) / s.lengthM;
       this.squeeze[i] =
         s.kind === 'main' &&
         squeezeState(
@@ -326,19 +611,32 @@ export class Engine {
    * window; past it they are committed to the signal like everyone else.
    */
   private transferToFlyovers() {
-    const v = this.vehicles;
-    for (let k = v.active.length - 1; k >= 0; k--) {
-      const id = v.active[k],
-        seg = v.segment[id];
-      const bypass = this.bypasses[seg];
-      if (bypass < 0 || !v.through[id] || v.flags[id] & 2) continue;
+    const v = this.vehicles,
+      candidates = this.transferCandidates;
+    // Only lanes of segments with an enabled bypass can hold candidates; process them in the same
+    // (descending active-index) order a full scan of `active` would.
+    candidates.length = 0;
+    for (const seg of this.bypassed) {
+      const s = this.network.segments[seg];
+      if (!this.config.infra.flyovers[s.toJunction]) continue;
+      const start = s.lengthM - this.network.segments[this.bypasses[seg]].lengthM;
+      for (let lane = 0; lane < 6; lane++)
+        for (const id of v.laneIndex[seg * LANES_PER_SEGMENT + lane]) {
+          const offset = v.s[id] - start;
+          if (v.through[id] && offset >= 0 && offset <= FLYOVER_WINDOW_M) candidates.push(id);
+        }
+    }
+    if (candidates.length > 1) candidates.sort((a, b) => v.activeIndex[b] - v.activeIndex[a]);
+    for (const id of candidates) {
+      const seg = v.segment[id],
+        bypass = this.bypasses[seg];
       const s = this.network.segments[seg],
         f = this.network.segments[bypass];
-      if (!this.config.infra.flyovers[s.toJunction]) continue;
       const offset = v.s[id] - (s.lengthM - f.lengthM);
-      if (offset < 0 || offset > FLYOVER_WINDOW_M) continue;
       const lane = Math.min(v.lane[id], this.lanes[bypass] - 1);
-      const { leader, follower } = v.neighbours(bypass, lane, offset);
+      v.locate(bypass, lane, offset);
+      const leader = v.foundLeader,
+        follower = v.foundFollower;
       const p = TYPE_PARAMS[v.type[id]];
       if (
         leader >= 0 &&
@@ -349,16 +647,23 @@ export class Engine {
         const q = TYPE_PARAMS[v.type[follower]];
         if (offset - p.length - v.s[follower] < q.s0 + q.T * v.v[follower]) continue;
       }
+      this.carryLateral(id, seg, v.s[id], bypass, offset);
       v.removeIndex(id);
       v.segment[id] = bypass;
       v.lane[id] = lane;
       v.s[id] = offset;
       v.flags[id] &= ~6;
+      v.committed[id] = 0;
       v.insert(id);
       v.gapHistory.fill(10000, id * 11, id * 11 + 11);
     }
   }
-  private constraints(id: number, lane: number) {
+  /**
+   * Lane-change pressure a vehicle feels in `lane` because it is the wrong lane for its route: a through
+   * vehicle outside the flyover lanes approaching the split, or one exiting at the next junction outside the
+   * kerb lane. Zero in a lane that suits the route.
+   */
+  private constraints(id: number, lane: number, out: Constraint) {
     const v = this.vehicles,
       seg = v.segment[id],
       s = this.network.segments[seg],
@@ -372,18 +677,36 @@ export class Engine {
     if (lane >= this.lanes[seg])
       cap = Math.min(cap, this.config.squeeze.virtualLaneSpeedCapKmh / 3.6);
     if (filtering) cap = Math.min(cap, 15 / 3.6);
-    const a = this.approaches[seg],
-      state = this.signals[a];
-    if (s.kind !== 'flyover' && state !== 2) {
-      const allowed = v.signalRoll[id] < (state === 1 ? p.amberRunProb : p.redRunProb);
-      if (!allowed) stop = s.lengthM - 2 - position;
+    const state = this.signalFor(seg);
+    // The stop line is 2 m before the segment end; once past it a vehicle carries on.
+    if (s.kind !== 'flyover' && position < s.lengthM - 2) {
+      if (state === 2) v.committed[id] = 0;
+      else if (!v.committed[id]) {
+        const dist = s.lengthM - 2 - position,
+          speed = v.v[id],
+          b = TYPE_PARAMS[v.type[id]].b;
+        // Dilemma zone: on amber, a driver who cannot stop comfortably goes; on red, only one who would need
+        // an emergency stop (or who runs reds anyway). Either decision holds until the line is crossed, so a
+        // vehicle let through on amber is never stopped dead when the light turns red.
+        // An amber runner commits once it can reach the line within about the amber time.
+        const runsAmber = state === 1 && v.signalRoll[id] < p.amberRunProb;
+        if (
+          state === 1
+            ? speed * speed > 2 * b * dist || (runsAmber && dist < 3 * speed + 5)
+            : speed * speed > 4 * b * dist || v.signalRoll[id] < p.redRunProb
+        )
+          v.committed[id] = 1;
+        else if (!runsAmber) stop = dist;
+      }
     }
-    for (const o of this.obstacleBySegment[seg])
-      if (o.lanes.includes(lane)) {
+    const obstacles = this.obstacleBySegment[seg],
+      masks = this.obstacleLaneMask[seg];
+    for (let obstacleIndex = 0; obstacleIndex < obstacles.length; obstacleIndex++)
+      if ((masks[obstacleIndex] >>> lane) & 1 && lane < 32) {
+        const o = obstacles[obstacleIndex];
         const delta = o.s - position;
         const radius = o.type === 'pothole' ? 8 : 5;
         if (delta >= -radius && delta < 60) {
-          const obstacleIndex = this.obstacleBySegment[seg].indexOf(o);
           if (
             lane === v.lane[id] &&
             o.type === 'pothole' &&
@@ -410,7 +733,7 @@ export class Engine {
         }
       }
     for (const d of this.activeDisruptions[seg]) {
-      if (['event', 'brokenSignal'].includes(d.type)) continue;
+      if (d.type === 'event' || d.type === 'brokenSignal') continue;
       const section = disruptionSection(d, s);
       if (position > section.end) continue;
       const dist = section.start - position;
@@ -425,21 +748,20 @@ export class Engine {
     if (
       this.config.environment.rain &&
       this.config.environment.rainIntensity === 2 &&
-      ['iblur', 'bellandur'].includes(s.toJunction) &&
-      s.kind === 'main'
+      this.floodProne[seg]
     ) {
       const dist = s.lengthM - 120 - position;
       if (position < s.lengthM - 20) {
+        // Stop short of the flooded kerb lane; a vehicle already in it wades out (capped) instead of freezing.
         if (lane === this.lanes[seg] - 1) {
-          stop = Math.min(stop, Math.max(0, dist));
+          if (dist >= 0) stop = Math.min(stop, dist);
           pressure = Math.max(pressure, 2 - dist / 60);
         }
         if (dist < 100) cap = Math.min(cap, 20 / 3.6);
       }
     }
-    for (const e of this.config.infra.encroachment)
+    for (const e of this.encroachmentBySegment[seg])
       if (
-        e.segmentId === s.id &&
         position < e.s + e.lengthM &&
         lane >= Math.max(1, this.lanes[seg] - Math.ceil(e.widthReductionM / 3.5))
       ) {
@@ -447,19 +769,52 @@ export class Engine {
         pressure = Math.max(pressure, 3 - (e.s - position) / 60);
       }
     if (v.type[id] === 4) {
-      for (let i = 0; i < this.config.infra.busStops.length; i++) {
-        const b = this.config.infra.busStops[i];
-        if (b.segmentId !== s.id || v.servedStop[id] === i || position > b.s + 5) continue;
-        if (b.s - position < 60 && lane !== this.lanes[seg] - 1) pressure = Math.max(pressure, 1);
-        if (lane === this.lanes[seg] - 1) {
-          stop = Math.min(stop, Math.max(0, b.s - position));
-          if (lane === v.lane[id] && b.s - position < 1 && v.v[id] < 0.5) {
-            if (!v.dwellUntil[id]) v.dwellUntil[id] = this.time + b.dwellS;
-            if (this.time >= v.dwellUntil[id]) {
-              v.servedStop[id] = i;
-              v.dwellUntil[id] = 0;
-            }
+      const stops = this.busStopsBySegment[seg],
+        kerb = this.lanes[seg] - 1,
+        bus = TYPE_PARAMS[4];
+      for (let k = 0; k < stops.length; k++) {
+        const i = stops[k],
+          b = this.config.infra.busStops[i];
+        if (v.servedStop[id] === i || position > b.s + 5) continue;
+        const dist = b.s - position,
+          dwelling = v.dwellUntil[id] > 0;
+        if (dist < BUS_STOP_APPROACH_M && lane !== kerb) pressure = Math.max(pressure, 1);
+        // Blocked out of the kerb lane by a standing queue, a bus stops in the next lane out instead.
+        if (lane !== kerb && !(lane === kerb - 1 && lane === v.lane[id] && dist < BUS_FALLBACK_M))
+          continue;
+        // Reached the kerb lane too late to pull in without an emergency stop: the stop is missed.
+        if (!dwelling && v.v[id] * v.v[id] > B_MAX * Math.max(0, dist + bus.s0 - 0.2)) continue;
+        // IDM comes to rest s0 short of a standing obstacle, so the virtual one sits s0 past the stop.
+        stop = Math.min(stop, Math.max(0, dist + bus.s0));
+        if (lane === v.lane[id] && dist < 2 && v.v[id] < 0.5) {
+          if (!dwelling) v.dwellUntil[id] = Math.max(this.time + b.dwellS, 1e-3);
+          else if (this.time >= v.dwellUntil[id]) {
+            v.servedStop[id] = i;
+            v.dwellUntil[id] = 0;
           }
+        }
+      }
+    }
+    if (this.yields[seg] && s.lengthM - position < LOOKAHEAD_M)
+      stop = Math.min(stop, this.giveWay(id, seg, lane, position));
+    // Courtesy: hold back behind a bus just ahead in the next lane toward the median that is working its way
+    // across to the kerb for its stop, so it can get in.
+    if (
+      this.busStopsBySegment[seg].length &&
+      lane > 0 &&
+      lane < this.lanes[seg] &&
+      v.type[id] !== 4 &&
+      !filtering
+    ) {
+      v.locate(seg, lane - 1, position);
+      const bus = v.foundLeader;
+      if (bus >= 0 && v.type[bus] === 4 && this.servingStop(bus)) {
+        const rear = v.s[bus] - TYPE_PARAMS[4].length - position;
+        if (rear < 30) {
+          if (rear > 1 && v.v[id] * v.v[id] < 2 * TYPE_PARAMS[v.type[id]].b * rear)
+            stop = Math.min(stop, rear);
+          // Alongside, or too close to hold back comfortably: ease off so the bus draws ahead.
+          else cap = Math.min(cap, Math.max(0.5, Math.min(v.v[bus] - 2, v.v[id] * 0.9)));
         }
       }
     }
@@ -475,13 +830,12 @@ export class Engine {
       )
     )
       pressure += 5;
-    return { cap, stop, pressure };
+    out.cap = cap;
+    out.stop = stop;
+    out.pressure = pressure;
+    return out;
   }
-  private changeLane(
-    id: number,
-    currentA: number,
-    current: { cap: number; stop: number; pressure: number },
-  ) {
+  private changeLane(id: number, currentA: number, current: Constraint) {
     const v = this.vehicles,
       seg = v.segment[id],
       lane = v.lane[id],
@@ -489,6 +843,8 @@ export class Engine {
       p = this.profiles[v.profile[id]],
       position = v.s[id],
       rain = this.weather;
+    // A bus heading for (or standing at) its stop only ever moves toward the kerb.
+    if (v.type[id] === 4 && this.servingStop(id)) return this.pullToKerb(id);
     const oldLeader = v.leader(id),
       oldGap = v.gap(id, oldLeader);
     if (
@@ -498,10 +854,12 @@ export class Engine {
       lane < this.lanes[seg] - 1 &&
       this.network.segments[seg].lengthM - position > 20
     ) {
-      const f = v.neighbours(seg, 6 + lane, position);
+      v.locate(seg, 6 + lane, position);
+      const fLeader = v.foundLeader,
+        fFollower = v.foundFollower;
       if (
-        (f.leader < 0 || v.s[f.leader] - position > 5) &&
-        (f.follower < 0 || position - v.s[f.follower] > 5)
+        (fLeader < 0 || v.s[fLeader] - position > 5) &&
+        (fFollower < 0 || position - v.s[fFollower] > 5)
       ) {
         v.moveLane(id, lane, true);
         v.filterEvents[id]++;
@@ -511,11 +869,13 @@ export class Engine {
     }
     if (v.flags[id] & 2) {
       if (current.stop > 20 && oldLeader >= 0) return;
-      for (const target of [lane, lane + 1]) {
-        const n = v.neighbours(seg, target, position);
+      for (let target = lane; target <= lane + 1; target++) {
+        v.locate(seg, target, position);
+        const leader = v.foundLeader,
+          follower = v.foundFollower;
         if (
-          v.gap(id, n.leader) > type.s0 + 2 &&
-          (n.follower < 0 || position - v.s[n.follower] > type.length + 3)
+          v.gap(id, leader) > type.s0 + 2 &&
+          (follower < 0 || position - v.s[follower] > type.length + 3)
         ) {
           v.moveLane(id, target);
           v.laneChanges[id]++;
@@ -527,7 +887,7 @@ export class Engine {
     }
     let best = lane,
       bestScore = -Infinity;
-    for (const target of [lane - 1, lane + 1]) {
+    for (let target = lane - 1; target <= lane + 1; target += 2) {
       if (
         target < 0 ||
         target >= this.effectiveLanes[seg] ||
@@ -541,16 +901,19 @@ export class Engine {
         )
       )
         continue;
-      const n = v.neighbours(seg, target, position),
-        gap = v.gap(id, n.leader),
-        back = n.follower < 0 ? 10000 : position - type.length - v.s[n.follower];
+      v.locate(seg, target, position);
+      const leader = v.foundLeader,
+        follower = v.foundFollower,
+        gap = leader >= 0 ? v.gap(id, leader) : this.gapAhead(id, seg, target, position),
+        leaderSpeed = leader >= 0 ? v.v[leader] : this.aheadSpeed,
+        back = follower < 0 ? 10000 : position - type.length - v.s[follower];
       if (gap < type.s0 * p.gapFactor || back < 2 * p.gapFactor) continue;
-      const targetConstraints = this.constraints(id, target);
+      const targetConstraints = this.constraints(id, target, this.target);
       // Same weather factors as the current-lane acceleration, or every other lane looks better in the rain.
       const ta = idm(
         v.v[id],
         Math.min(gap, targetConstraints.stop),
-        n.leader < 0 ? 0 : v.v[id] - v.v[n.leader],
+        gap <= targetConstraints.stop ? v.v[id] - leaderSpeed : v.v[id],
         type,
         Math.min(type.vMax * rain.speed, targetConstraints.cap),
         rain.headway,
@@ -558,21 +921,21 @@ export class Engine {
       );
       let before = 0,
         after = 0;
-      if (n.follower >= 0) {
-        const fp = TYPE_PARAMS[v.type[n.follower]];
+      if (follower >= 0) {
+        const fp = TYPE_PARAMS[v.type[follower]];
         before = idm(
-          v.v[n.follower],
-          n.leader < 0 ? 10000 : v.s[n.leader] - fp.length - v.s[n.follower],
-          n.leader < 0 ? 0 : v.v[n.follower] - v.v[n.leader],
+          v.v[follower],
+          leader < 0 ? 10000 : v.s[leader] - fp.length - v.s[follower],
+          leader < 0 ? 0 : v.v[follower] - v.v[leader],
           fp,
           fp.vMax * rain.speed,
           rain.headway,
           rain.accel,
         );
         after = idm(
-          v.v[n.follower],
+          v.v[follower],
           back,
-          v.v[n.follower] - v.v[id],
+          v.v[follower] - v.v[id],
           fp,
           fp.vMax * rain.speed,
           rain.headway,
@@ -587,13 +950,50 @@ export class Engine {
       }
     }
     if (best !== lane) {
-      const back = v.neighbours(seg, best, position).follower;
+      v.locate(seg, best, position);
+      const back = v.foundFollower;
       if (back >= 0 && v.v[back] > v.v[id] + 2) v.nearMisses[back]++;
       v.moveLane(id, best);
       v.laneChanges[id]++;
       v.cooldown[id] = this.time + p.lcCooldown;
       return true;
     }
+  }
+  /** Moves a bus one lane toward the kerb when the gap is safe (no incentive test). */
+  private pullToKerb(id: number) {
+    const v = this.vehicles,
+      seg = v.segment[id],
+      target = v.lane[id] + 1,
+      type = TYPE_PARAMS[v.type[id]],
+      position = v.s[id],
+      rain = this.weather;
+    if (v.flags[id] & 2 || v.dwellUntil[id] > 0 || target >= this.lanes[seg]) return;
+    v.locate(seg, target, position);
+    const leader = v.foundLeader,
+      follower = v.foundFollower,
+      gap = leader >= 0 ? v.gap(id, leader) : FREE_GAP,
+      back = follower < 0 ? FREE_GAP : position - type.length - v.s[follower];
+    // Buses force their way to the kerb: any physical gap will do, as long as nobody needs to brake harder
+    // than B_MAX / 2 for it.
+    if (gap < 1 || back < 1) return;
+    if (leader >= 0 && idm(v.v[id], gap, v.v[id] - v.v[leader], type) < -B_MAX / 2) return;
+    if (follower >= 0) {
+      const fp = TYPE_PARAMS[v.type[follower]];
+      const after = idm(
+        v.v[follower],
+        back,
+        v.v[follower] - v.v[id],
+        fp,
+        fp.vMax * rain.speed,
+        rain.headway,
+        rain.accel,
+      );
+      if (after < -B_MAX / 2) return;
+    }
+    v.moveLane(id, target);
+    v.laneChanges[id]++;
+    v.cooldown[id] = this.time + BUS_PULL_COOLDOWN_S;
+    return true;
   }
   step() {
     if (this.finished) return;
@@ -620,25 +1020,26 @@ export class Engine {
     const historySlot = this.ticks % 11;
     for (const id of v.active) {
       const leader = v.leader(id),
-        p = TYPE_PARAMS[v.type[id]],
-        behaviour = this.profiles[v.profile[id]];
+        p = TYPE_PARAMS[v.type[id]];
       const index = id * 11,
-        delay = Math.min(10, Math.round(behaviour.reactionTime / DT)),
+        delay = this.profileDelay[v.profile[id]],
         delayed = index + ((historySlot - delay + 11) % 11);
       const laneCheck = this.ticks % 5 === id % 5 && this.time >= v.cooldown[id];
-      const actualGap = v.gap(id, leader);
+      const actualGap =
+        leader >= 0 ? v.gap(id, leader) : this.gapAhead(id, v.segment[id], v.lane[id], v.s[id]);
       // At rest with both actual and perceived gaps below s0, IDM cannot produce positive acceleration.
       // Preserve perception history while avoiding repeated obstacle/MOBIL work for stationary followers.
       if (!laneCheck && v.v[id] === 0 && actualGap <= p.s0 && v.gapHistory[delayed] <= p.s0) {
         v.gapHistory[index + historySlot] = actualGap;
-        v.dvHistory[index + historySlot] = leader < 0 ? 0 : -v.v[leader];
+        v.dvHistory[index + historySlot] = leader < 0 ? -this.aheadSpeed : -v.v[leader];
         v.a[id] = 0;
         this.nextGap[id] = actualGap;
+        this.gapIsAhead[id] = Number(leader < 0);
         continue;
       }
-      const constraint = this.constraints(id, v.lane[id]);
-      let gap = Math.min(v.gap(id, leader), constraint.stop),
-        dv = gap === constraint.stop ? v.v[id] : leader < 0 ? 0 : v.v[id] - v.v[leader];
+      let constraint = this.constraints(id, v.lane[id], this.current);
+      let gap = this.perceive(id, constraint.stop),
+        dv = this.perceivedDV;
       v.gapHistory[index + historySlot] = gap;
       v.dvHistory[index + historySlot] = dv;
       let a = idm(
@@ -651,16 +1052,15 @@ export class Engine {
         rain.accel,
       );
       if (laneCheck && this.changeLane(id, a, constraint)) {
-        const newLeader = v.leader(id),
-          c = this.constraints(id, v.lane[id]);
-        gap = Math.min(v.gap(id, newLeader), c.stop);
-        dv = gap === c.stop ? v.v[id] : newLeader < 0 ? 0 : v.v[id] - v.v[newLeader];
+        constraint = this.constraints(id, v.lane[id], this.current);
+        gap = this.perceive(id, constraint.stop);
+        dv = this.perceivedDV;
         a = idm(
           v.v[id],
           gap,
           dv,
           p,
-          Math.min(p.vMax * rain.speed, c.cap),
+          Math.min(p.vMax * rain.speed, constraint.cap),
           rain.headway,
           rain.accel,
         );
@@ -670,12 +1070,31 @@ export class Engine {
         (v.flags[id] & 2) === 0 &&
         v.laneIndex[v.segment[id] * LANES_PER_SEGMENT + filterLane].length
       ) {
-        const filtered = v.neighbours(v.segment[id], filterLane, v.s[id]).leader;
+        v.locate(v.segment[id], filterLane, v.s[id]);
+        const filtered = v.foundLeader;
         if (filtered >= 0 && v.s[filtered] - v.s[id] < 10) a -= 0.3;
       }
-      v.a[id] = a;
+      // Perception lags by the reaction time, so IDM alone can brake too late. Whenever the actual gap needs
+      // more than comfortable braking to avoid contact, brake kinematically (up to B_MAX) instead of
+      // relying on the no-overlap guard below to stop the vehicle instantly.
+      if (dv > 0) {
+        const need = (dv * dv) / (2 * Math.max(0.05, gap - 0.3));
+        if (need > 0.5 * p.b) a = Math.min(a, -Math.min(B_MAX, need));
+      }
+      // Safe-speed cap (Gipps-style): after this step the vehicle must still be able to stop behind where the
+      // thing ahead would stop if it braked at B_MAX, so decelerations stay physical instead of the guard below
+      // stopping it dead: v' ≤ −B·DT + sqrt((B·DT)² + 2·B·(gap − 0.1) + v_leader²).
+      if (gap < FREE_GAP) {
+        const leaderV = Math.max(0, v.v[id] - dv),
+          bdt = B_MAX * DT,
+          safe =
+            -bdt + Math.sqrt(bdt * bdt + 2 * B_MAX * Math.max(0, gap - 0.1) + leaderV * leaderV);
+        a = Math.min(a, (safe - v.v[id]) / DT);
+      }
+      v.a[id] = Math.max(-B_MAX, a);
       this.nextGap[id] = gap;
       this.nextDV[id] = dv;
+      this.gapIsAhead[id] = Number(this.perceivedAhead);
       v.previous[id] = v.s[id];
     }
     // Integrate only after all accelerations are known; hard gap guard prevents overlap despite delayed perception.
@@ -686,7 +1105,19 @@ export class Engine {
         let newV = Math.max(0, oldV + v.a[id] * DT);
         const move = Math.max(0, (oldV + newV) * 0.5 * DT);
         const gap = this.nextGap[id];
-        let travel = Math.min(move, Math.max(0, gap - 0.1));
+        // A leader beyond the segment end (possibly still on the other side of a merge) cannot be hit before
+        // the end: brake at B_MAX there rather than stopping dead; the transfer step checks the space.
+        const bound = this.gapIsAhead[id]
+          ? Math.max(
+              gap,
+              Math.min(
+                this.network.segments[v.segment[id]].lengthM - v.s[id],
+                // this step's travel when braking at B_MAX, plus the 0.1 m margin
+                (oldV + Math.max(0, oldV - B_MAX * DT)) * 0.5 * DT + 0.1 + 1e-4,
+              ),
+            )
+          : gap;
+        let travel = Math.min(move, Math.max(0, bound - 0.1));
         if (k < list.length - 1) {
           const leader = list[k + 1];
           travel = Math.min(
@@ -698,6 +1129,8 @@ export class Engine {
         v.s[id] += travel;
         v.distance[id] += travel;
         v.v[id] = newV;
+        // Realised acceleration (after the guard), used for brake-light cues.
+        v.a[id] = (newV - oldV) / DT;
         const hard = (newV - oldV) / DT < -3.5;
         if (hard && !(v.flags[id] & 1)) v.hardBrakes[id]++;
         v.flags[id] = hard ? v.flags[id] | 1 : v.flags[id] & ~1;
@@ -718,7 +1151,7 @@ export class Engine {
         seg = v.segment[id],
         s = this.network.segments[seg];
       if (v.s[id] < s.lengthM) continue;
-      const junction = this.network.junctions.findIndex((j) => j.id === s.toJunction);
+      const junction = this.toJunctionIndex[seg];
       const next = this.next[seg];
       const divert = next >= 0 && this.activeDisruptions[next].some((d) => d.type === 'closure');
       const bail =
@@ -755,34 +1188,54 @@ export class Engine {
         v.despawn(id);
         continue;
       }
-      let lane = Math.min(v.lane[id], this.lanes[next] - 1);
-      if (
-        !laneAllowed(
-          v.type[id],
-          lane,
-          this.lanes[next],
-          this.config.infra.busLane,
-          Boolean(v.busAllowed[id]),
-        )
-      )
-        lane = Math.max(0, lane - 1);
+      const lane = this.entryLane(id, seg, next, v.lane[id]);
       const receiving = v.laneIndex[next * LANES_PER_SEGMENT + lane][0] ?? -1;
-      const space = receiving < 0 ? 10000 : v.s[receiving] - TYPE_PARAMS[v.type[receiving]].length;
-      if (space < TYPE_PARAMS[v.type[id]].s0 + 1) {
+      const space =
+        receiving < 0 ? FREE_GAP : v.s[receiving] - TYPE_PARAMS[v.type[receiving]].length;
+      // The look-ahead normally keeps the vehicle 0.1 m behind the receiving lane's last vehicle; only a
+      // vehicle that merged into that lane during this same step can leave no room at all.
+      if (space < 0.1) {
         v.s[id] = s.lengthM;
-        v.v[id] = 0;
+        v.v[id] = Math.min(v.v[id], v.v[receiving]);
         continue;
       }
-      if (s.kind !== 'flyover' && this.signals[this.approaches[seg]] === 0) v.redRuns[id]++;
+      if (s.kind !== 'flyover' && this.signalFor(seg) === 0) {
+        v.redRuns[id]++;
+        v.redRunAt[id] = this.time;
+      }
+      const nextS = Math.min(v.s[id] - s.lengthM, space - 0.1);
+      this.carryLateral(id, seg, v.s[id], next, nextS);
       v.removeIndex(id);
       v.segment[id] = next;
       v.lane[id] = lane;
-      v.s[id] = Math.min(v.s[id] - s.lengthM, space - 0.5);
+      v.s[id] = nextS;
       v.flags[id] &= ~6;
       v.signalRoll[id] = this.behaviourRng.next();
       v.servedStop[id] = -1;
+      v.dwellUntil[id] = 0;
+      v.committed[id] = 0;
       v.insert(id);
       v.gapHistory.fill(10000, id * 11, id * 11 + 11);
+    }
+    // Drawn lateral position eases toward the logical lane (rendering only; never read by the model).
+    for (const id of v.active) {
+      const target = this.lateralTarget(v.segment[id], v.lane[id] + (v.flags[id] & 2 ? 0.5 : 0)),
+        old = v.latM[id];
+      if (old !== old) {
+        v.latM[id] = target;
+        v.latV[id] = 0;
+        continue;
+      }
+      const type = v.type[id],
+        limit = Math.min(LATERAL_SPEED[type], LATERAL_CREEP + LATERAL_STEER[type] * v.v[id]),
+        last = v.latV[id];
+      let speed = ((target - old) * LATERAL_RELAX[type]) / DT;
+      speed = Math.max(-limit, Math.min(limit, speed));
+      speed = Math.max(last - LATERAL_ACCEL * DT, Math.min(last + LATERAL_ACCEL * DT, speed));
+      // Never overshoot the lane centre.
+      if ((target - old) * (target - old - speed * DT) < 0) speed = (target - old) / DT;
+      v.latM[id] = old + speed * DT;
+      v.latV[id] = speed;
     }
     this.ticks++;
     if (this.ticks % 10 === 0) this.stats.sample(v, this.time, this.effectiveLanes);

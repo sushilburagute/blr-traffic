@@ -1,5 +1,5 @@
 import LZString from 'lz-string';
-import { defaults, mergeConfig } from './schema';
+import { CONFIG_VERSION, defaults, defaultsFor, mergeConfig } from './schema';
 import type { DeepPartial, ScenarioConfig } from '@/sim/types';
 function diff(value: unknown, base: unknown): unknown {
   if (JSON.stringify(value) === JSON.stringify(base)) return undefined;
@@ -13,9 +13,16 @@ function diff(value: unknown, base: unknown): unknown {
   }
   return value;
 }
+/**
+ * Share code: the differences from the current defaults, tagged with the format version so a link keeps
+ * its meaning when later versions change the defaults (see `defaultsFor`).
+ */
 export function encode(config: ScenarioConfig) {
   const code = LZString.compressToEncodedURIComponent(
-    JSON.stringify(diff(config, defaults()) ?? {}),
+    JSON.stringify({
+      ...(diff(config, defaults()) as object | undefined),
+      version: CONFIG_VERSION,
+    }),
   ).replace(/\+/g, '_');
   if (code.length >= 2000)
     throw new Error('This scenario is too large for a share link. Download its JSON instead.');
@@ -34,5 +41,9 @@ export function decode(code: string): ScenarioConfig {
   }
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new Error('Invalid scenario');
-  return mergeConfig(defaults(), value as DeepPartial<ScenarioConfig>);
+  // Unversioned links predate version 2 and are differences from the version 1 defaults.
+  return mergeConfig(
+    defaultsFor((value as { version?: unknown }).version),
+    value as DeepPartial<ScenarioConfig>,
+  );
 }

@@ -5,7 +5,7 @@ Source: **osm**.
 
 
 toMarathahalli: 10.989 km
-toSilkBoard: 10.979 km
+toSilkBoard: 11.020 km
 
 29 segments. Verified flyovers: Agara, Iblur, Bellandur, Kadubeesanahalli, Marathahalli.
 

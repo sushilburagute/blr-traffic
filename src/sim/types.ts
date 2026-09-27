@@ -88,7 +88,7 @@ export interface Disruption {
   params: { lanesBlocked?: number; lengthM?: number; vehPerHour?: number; sourceId?: string };
 }
 export interface ScenarioConfig {
-  version: 1;
+  version: 2;
   seed: number;
   durationMin: number;
   startClock: string;
@@ -176,12 +176,23 @@ export interface Snapshot {
   simTime: number;
   clock: string;
   count: number;
-  pos: Float32Array;
+  /**
+   * [lon, lat] per vehicle, from the continuous drawn lateral position on smoothly offset geometry
+   * (lane width is fixed at widthM / lanes; the squeeze lane lies just beyond the kerb edge).
+   */
+  pos: Float64Array;
+  /** Compass heading, degrees clockwise from north: road bearing plus atan2(lateral velocity, max(v, 1)). */
   heading: Float32Array;
   speed: Float32Array;
   type: Uint8Array;
   profile: Uint8Array;
   flags: Uint8Array;
+  /**
+   * Visual cue bits per vehicle: 1 braking (deceleration > 0.8 m/s², or held stationary below 0.5 m/s);
+   * 2 indicating left / 4 indicating right (drawn position still moving toward its lane, left = toward the
+   * vehicle's own left, i.e. smaller lateral offset); 8 ran a red light within the last 5 s of sim time.
+   */
+  cues: Uint8Array;
   signals: Uint8Array;
   queues: Float32Array;
   segmentSpeed: Float32Array;

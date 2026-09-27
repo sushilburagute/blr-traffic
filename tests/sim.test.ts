@@ -147,3 +147,84 @@ describe('traffic physics', () => {
     expect(next.ids[0]).toBe(e.vehicles.uid[e.vehicles.active[0]]);
   });
 });
+describe('segment boundaries', () => {
+  it('a vehicle sees a standing leader across a segment boundary and stops behind it plausibly', () => {
+    const c = mergeConfig(presetConfig('sunday-morning'), {
+      durationMin: 2,
+      demand: { vehPerHour: 0 },
+      environment: { potholes: 0, speedBreakers: 0 },
+      infra: {
+        signals: {
+          agara: {
+            cycleS: 120,
+            offsetS: 0,
+            phases: [{ approaches: [0, 1], greenS: 120, amberS: 0 }],
+          },
+        },
+      },
+    });
+    const e = createEngine(network, c),
+      v = e.vehicles;
+    const from = network.segments.findIndex((s) => s.id === 'toMarathahalli-silkBoard-agara'),
+      to = network.segments.findIndex((s) => s.id === 'toMarathahalli-agara-iblur');
+    const truck = v.spawn(to, 1, 5, 0, 0),
+      car = v.spawn(from, 1, 2, 0, 0);
+    v.s[truck] = 12;
+    v.s[car] = network.segments[from].lengthM - 150;
+    v.v[car] = 16;
+    for (const id of [truck, car]) {
+      v.exitJunction[id] = 5;
+      v.signalRoll[id] = 1;
+      v.cooldown[id] = 1000;
+    }
+    v.rebuildIndex();
+    let worst = 0;
+    for (let t = 0; t < 400; t++) {
+      const before = v.v[car];
+      e.step();
+      v.v[truck] = 0;
+      v.s[truck] = 12;
+      worst = Math.max(worst, (before - v.v[car]) / 0.1);
+    }
+    expect(v.segment[car]).toBe(to);
+    expect(v.v[car]).toBeLessThan(0.1);
+    expect(v.s[car]).toBeLessThanOrEqual(12 - 9 + 0.01 - 0.09);
+    expect(worst).toBeLessThanOrEqual(9);
+  });
+  it('buses never skip a stop because they changed lanes away from it', () => {
+    const mains = network.segments.filter((s) => s.kind === 'main');
+    const c = mergeConfig(presetConfig('monday-9am'), {
+      durationMin: 6,
+      demand: { mix: { bus: 30 } },
+      infra: {
+        busStops: mains.map((s) => ({
+          segmentId: s.id,
+          s: Math.round(s.lengthM * 0.3),
+          dwellS: 15,
+        })),
+      },
+    });
+    const e = createEngine(network, c),
+      v = e.vehicles;
+    const stopOf = new Map(c.infra.busStops.map((b, i) => [b.segmentId, i]));
+    let passes = 0,
+      served = 0;
+    for (let t = 0; t < 3600; t++) {
+      const ahead = new Map<number, number>();
+      for (const id of v.active) if (v.type[id] === 4) ahead.set(id, v.s[id]);
+      e.step();
+      for (const [id, s0] of ahead) {
+        if (v.segment[id] < 0) continue;
+        const i = stopOf.get(network.segments[v.segment[id]].id);
+        if (i === undefined || v.type[id] !== 4) continue;
+        const b = c.infra.busStops[i];
+        if (s0 <= b.s + 5 && v.s[id] > b.s + 5) {
+          passes++;
+          if (v.servedStop[id] === i) served++;
+        }
+      }
+    }
+    expect(passes).toBeGreaterThan(20);
+    expect(served / passes).toBeGreaterThan(0.8);
+  }, 30000);
+});

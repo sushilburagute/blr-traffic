@@ -21,14 +21,22 @@ The mean step meets the 3 ms target; p99 does not. Layer construction excludes G
 MapLibre, and compositing. The **8 ms frame target and sustained 60 fps at 10,000 vehicles remain
 unverified on a hardware GPU**. Raw results are written to ignored `artifacts/perf.json`.
 
-`yarn bench` runs the full 45-minute Monday preset at 12,000 veh/h. The latest unprofiled run of the
-final implementation took **32.40 seconds**, with 3,355 completed trips, 4,315 active vehicles, and
-1,404 waiting to enter. It does **not** meet the plan's 15-second target. Earlier runs varied from
-15.7 to 32.4 seconds with machine load; no reliable faster bound is claimed.
+`yarn bench` runs the full 45-minute Monday preset, now at the calibrated 13,000 veh/h and 50 km/h (see
+Calibration in `implementation-notes.md`). On 2026-09-27, measured back to back on the same (heavily loaded)
+machine, the pre-calibration defaults took 40.7–43.0 s (3,956 completed trips, 5,038 active, 80 waiting to
+enter) and the calibrated defaults 40.4–44.7 s (3,842 completed, 5,734 active, 128 waiting): about the same,
+at most a few percent slower. Earlier the same day, on a lighter load, the pre-calibration run took 18.2 s;
+v0.1 took 14–32 s depending on load; no reliable faster bound is claimed.
 
-Peak queues: Silk Board 349 m, Agara 672 m, Iblur 144 m, Bellandur 166 m, Kadubeesanahalli 757 m,
-Marathahalli 63 m. These do not reproduce the plan's proposed congestion at every named junction.
-Signal timings and demand remain assumptions requiring observational calibration.
+Peak queues in the 45-minute bench: Silk Board 350 m, Agara 765 m, Iblur 273 m, Bellandur 222 m,
+Kadubeesanahalli 822 m, Marathahalli 102 m (was 352, 672, 420, 266, 685 and 80 m).
+
+Uncensored trip times (`yarn trips`: every vehicle generated in the 45-minute window, run on until it
+finishes): Silk Board → Marathahalli median 31.7 min (mean 34.8, p90 56.2); Marathahalli → Silk Board median
+42.7 min (mean 46.8, p90 79.0); free flow 13.2 min; side-road entry wait median 0.1 min. Before calibration
+they were 18.5 (mean 23.1, p90 39.2) and 41.3 (mean 43.6, p90 74.6) with free flow 11.0 min. The in-app
+report averages only trips completed inside the run, which biases it low. Signal timings remain assumptions;
+demand and free speed are tuned to inferred, not measured, trip times.
 
 A CPU profile attributes most work to the vehicle step, constraints, lane changes, and neighbour
 searches. Reproduce with `node --cpu-prof --cpu-prof-dir=artifacts --import tsx scripts/bench.ts`,
@@ -41,11 +49,19 @@ Next's production build reports approximately **145 kB** first-load JS for `/` a
 their deferred chunks are additional downloads. These figures are build output, not a measurement
 of all chunks or total network transfer.
 
-Rendering uses binary typed-array attributes, recycled transferable snapshots, and reusable position
-buffers. Positions extrapolate for at most 50 ms of wall time between snapshots. Layers are cloned
-to update position attributes; zero allocations per frame is not claimed. Static layers rebuild when
-snapshots, configuration, or display options change. The overlay is non-interleaved. Bypasses share
-the final 700 m of the associated OSM carriageway without separate elevation geometry.
+Rendering uses binary typed-array attributes, recycled transferable snapshots, and reusable Float64
+position buffers (Float32 lon/lat quantises to ~0.8 m, visible as jitter up close). `VehicleFrame`
+matches vehicles by uid and interpolates each one from where it was drawn to its latest snapshot
+pose over one measured snapshot interval, so rendering trails the simulation by ~50 ms. Colour,
+size and icon attributes keep their identity between snapshots; only positions and angles are
+re-uploaded per frame, and nothing is re-submitted once every vehicle has settled. Road, lane,
+label and obstacle geometry is built once per network/config (layer instances are recreated per
+update, because deck.gl cannot re-add a finalized layer). The overlay is non-interleaved. Bypasses
+share the final 700 m of the associated OSM carriageway; their deck is drawn above ground vehicles.
+
+`yarn tsx scripts/perf.ts` on 2026-09-27 (10k synthetic vehicles, loaded machine): step 3.36 ms mean,
+snapshot 1.54 ms, per-snapshot layer + frame preparation 1.80 ms, per-animation-frame vehicle
+interpolation and layer construction 0.40 ms. `yarn bench` took 18.5 s.
 
 Worker pacing yields after a 12 ms playback work budget or 40 ms while skipping; an individual step
 may overrun that budget. Snapshots are capped at 20 Hz and stats at every 5 seconds, plus immediate

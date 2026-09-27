@@ -67,6 +67,8 @@ function config(patch: DeepPartial<ScenarioConfig> = {}) {
       environment: { potholes: 0, speedBreakers: 0 },
       squeeze: { enabled: false },
       infra: {
+        // These mechanism tests were tuned at 60 km/h, the pre-calibration default (now 50).
+        speedLimitKmh: 60,
         signals: {
           agara: {
             cycleS: 120,
@@ -301,5 +303,117 @@ describe('weather and grade separation', () => {
     );
     grounded.run(1500);
     expect(grounded.report().completedTrips).toBe(0);
+  });
+});
+describe('visible behaviour', () => {
+  it('buses pull in to the kerb, dwell at their stop for the dwell time and then continue', () => {
+    const e = createEngine(
+      network,
+      config({
+        demand: {
+          vehPerHour: 3000,
+          mix: { twoWheeler: 0, auto: 0, car: 80, cab: 0, bus: 20, truck: 0 },
+        },
+        infra: { busStops: [{ segmentId: 'road', s: 450, dwellS: 10 }] },
+      }),
+    );
+    const v = e.vehicles,
+      dwellStart = new Map<number, number>(),
+      servedAt = new Map<number, number>(),
+      passed = new Set<number>();
+    for (let t = 0; t < 3000; t++) {
+      e.step();
+      for (const id of v.active) {
+        if (v.type[id] !== 4) continue;
+        const uid = v.uid[id];
+        if (v.dwellUntil[id] > 0) {
+          if (!dwellStart.has(uid)) dwellStart.set(uid, e.time);
+          expect(Math.abs(v.s[id] - 450)).toBeLessThan(2.5);
+          expect(v.v[id]).toBeLessThan(0.5);
+        }
+        if (v.servedStop[id] === 0 && !servedAt.has(uid)) servedAt.set(uid, e.time);
+        if (v.s[id] > 460) passed.add(uid);
+      }
+    }
+    expect(passed.size).toBeGreaterThan(5);
+    for (const uid of passed) {
+      expect(servedAt.has(uid), `bus ${uid} skipped its stop`).toBe(true);
+      expect(servedAt.get(uid)! - dwellStart.get(uid)!).toBeGreaterThanOrEqual(10 - 1e-6);
+    }
+  });
+  it('front vehicles at a red light stop behind the stop line', () => {
+    const e = createEngine(
+      network,
+      config({
+        demand: { vehPerHour: 3000 },
+        infra: {
+          signals: {
+            agara: {
+              cycleS: 120,
+              offsetS: 0,
+              phases: [{ approaches: [2], greenS: 120, amberS: 0 }],
+            },
+          },
+        },
+      }),
+    );
+    e.run(1500);
+    const L = network.segments[0].lengthM;
+    let fronts = 0;
+    for (let lane = 0; lane < 3; lane++) {
+      const list = e.vehicles.laneIndex[lane];
+      const id = list[list.length - 1];
+      if (id === undefined) continue;
+      fronts++;
+      expect(e.vehicles.v[id]).toBeLessThan(0.5);
+      expect(e.vehicles.s[id]).toBeLessThanOrEqual(L - 2 + 0.01);
+      expect(e.vehicles.s[id]).toBeGreaterThan(L - 2 - 3);
+    }
+    expect(fronts).toBe(3);
+  });
+  it('snapshots ease lane changes sideways, signal the direction, and ignore squeeze re-layout', async () => {
+    const { makeSnapshot, snapshotBuffers } = await import('@/sim/snapshot');
+    const { distance } = await import('@/sim/network');
+    const e = createEngine(network, config({ demand: { vehPerHour: 0 } }));
+    const v = e.vehicles;
+    const car = v.spawn(0, 1, 2, 0, 0),
+      parked = v.spawn(0, 2, 2, 0, 0);
+    v.s[car] = 100;
+    v.v[car] = 10;
+    v.s[parked] = 300;
+    for (const id of [car, parked]) {
+      v.signalRoll[id] = 1;
+      v.cooldown[id] = 1000;
+      v.exitJunction[id] = 1;
+    }
+    v.rebuildIndex();
+    e.step();
+    let s = makeSnapshot(e);
+    expect(snapshotBuffers(s)).toContain(s.cues.buffer);
+    const index = (uid: number) => Array.from(s.ids.subarray(0, s.count)).indexOf(uid);
+    expect(s.cues[index(v.uid[parked])] & 1).toBe(1); // held on the brake while stationary
+    expect(s.cues[index(v.uid[car])] & 6).toBe(0);
+    // Towards the median (lane 0) is towards larger offsets, i.e. the driver's right.
+    v.moveLane(car, 0);
+    let last: [number, number] = [s.pos[2 * index(v.uid[car])], s.pos[2 * index(v.uid[car]) + 1]];
+    let steps = 0;
+    for (; steps < 100; steps++) {
+      e.step();
+      s = makeSnapshot(e, s);
+      const i = index(v.uid[car]),
+        now: [number, number] = [s.pos[2 * i], s.pos[2 * i + 1]];
+      // Positions are Float32 lon/lat: one ulp of longitude here is ~0.83 m.
+      expect(distance(last, now)).toBeLessThan(v.v[car] * 0.1 + 0.5 + 0.85);
+      last = now;
+      if (!(s.cues[i] & 6)) break;
+      expect(s.cues[i] & 6).toBe(4);
+    }
+    expect(steps).toBeGreaterThan(10); // takes a couple of seconds, not one tick
+    expect(Math.abs(v.latM[car] - e.lateralTarget(0, 0))).toBeLessThan(0.16);
+    // Opening the squeeze lane must not move anyone sideways.
+    const before = s.pos.slice(0, s.count * 2);
+    e.effectiveLanes[0] += 1;
+    s = makeSnapshot(e, s);
+    expect(s.pos.slice(0, s.count * 2)).toEqual(before);
   });
 });

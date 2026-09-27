@@ -36,6 +36,16 @@ export const defaultSignals: Record<JunctionId, SignalPlan> = {
   kadubeesanahalli: defaultSignal,
   marathahalli: signalPlan(150, 45),
 };
+/**
+ * Scenario format version. Version 2 (2026-09) recalibrated the Monday 9 AM defaults (demand 13,000 veh/h,
+ * speed limit 50 km/h; see plan/implementation-notes.md, Calibration). Share links store only differences
+ * from the defaults, so an unversioned (v1) link is read against the v1 defaults to keep its meaning.
+ */
+export const CONFIG_VERSION = 2;
+const V1_DEFAULTS = {
+  demand: { vehPerHour: 12000 },
+  infra: { speedLimitKmh: 60 },
+} satisfies DeepPartial<ScenarioConfig>;
 const nonnegative = z.number().finite().min(0);
 const junctionRecord = <T extends z.ZodTypeAny>(schema: T) =>
   z.object(
@@ -129,7 +139,11 @@ const mix = z
   .refine((v) => Object.values(v).reduce((a, b) => a + b, 0) > 0, 'Mix cannot be empty');
 export const scenarioConfigSchema = z
   .object({
-    version: z.literal(1).default(1),
+    // Version 1 configs (older defaults) are still accepted; see `defaultsFor`.
+    version: z
+      .union([z.literal(1), z.literal(CONFIG_VERSION)])
+      .default(CONFIG_VERSION)
+      .transform((): typeof CONFIG_VERSION => CONFIG_VERSION),
     seed: z.number().int().min(0).max(4294967295).default(42),
     durationMin: z.number().min(1).max(60).default(45),
     startClock: z
@@ -138,7 +152,7 @@ export const scenarioConfigSchema = z
       .default('08:30'),
     demand: z
       .object({
-        vehPerHour: nonnegative.max(20000).default(12000),
+        vehPerHour: nonnegative.max(20000).default(13000),
         profile: z.enum(['morning', 'evening', 'flat', 'custom']).default('morning'),
         customCurve: z.array(nonnegative.max(5)).length(60).optional(),
         mix: mix.default({}),
@@ -162,7 +176,7 @@ export const scenarioConfigSchema = z
     infra: z
       .object({
         lanesOverride: z.record(z.number().int().min(1).max(5)).optional(),
-        speedLimitKmh: z.number().min(10).max(100).default(60),
+        speedLimitKmh: z.number().min(10).max(100).default(50),
         busLane: z.boolean().default(false),
         flyovers: junctionRecord(z.boolean().default(false)).default({
           agara: true,
@@ -274,6 +288,10 @@ export function mergeConfig(
   patch: DeepPartial<ScenarioConfig>,
 ): ScenarioConfig {
   return scenarioConfigSchema.parse(merge(base, patch));
+}
+/** Defaults as they were in a given scenario version (the current defaults for the current version). */
+export function defaultsFor(version: unknown): ScenarioConfig {
+  return version === undefined || version === 1 ? mergeConfig(defaults(), V1_DEFAULTS) : defaults();
 }
 export function migrate(value: unknown): ScenarioConfig {
   return scenarioConfigSchema.parse(value);

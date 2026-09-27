@@ -16,12 +16,20 @@ import {
   type ScenarioConfig,
   type Snapshot,
 } from '@/sim/types';
+
+/** Ring colours match haloColor in vehicleFrame.ts. */
+const BEHAVIOUR_RINGS = [
+  ['Ran a red', '#ff453a'],
+  ['Squeeze lane', '#f5c362'],
+  ['Filtering', '#6ecdff'],
+] as const;
+/** Indicator blink half-period, ms. */
+const BLINK_MS = 380;
 import { projectSegment, distance } from '@/sim/network';
 import { overview, flyToJunction } from './camera';
-import { makeLayers } from './layers';
+import { sceneLayers, vehicleLayers, type Scene } from './layers';
 import { Minimap } from './Minimap';
-import { SnapshotFrame } from './useSnapshotFrame';
-import type { Layer } from '@deck.gl/core';
+import { VehicleFrame, CUE_BRAKE, CUE_RED_RUN, type VehicleGroup } from './vehicleFrame';
 import 'maplibre-gl/dist/maplibre-gl.css';
 export default function MapCanvas({
   network,
@@ -91,18 +99,18 @@ export default function MapCanvas({
       .catch(() => {
         if (!disposed) setOffline(true);
       });
+    const vehicles = new VehicleFrame(network);
+    const groups: Record<string, VehicleGroup | undefined> = {};
     const overlay = new MapboxOverlay({
       interleaved: false,
       getTooltip: (info) => {
-        const s = snapshotRef.current;
-        if (
-          (info.layer?.id === 'vehicles' || info.layer?.id === 'vehicle-icons') &&
-          s &&
-          info.index >= 0
-        ) {
-          const i = info.index;
+        const s = vehicles.latest,
+          id = info.layer?.id ?? '',
+          group = groups[id.slice(id.lastIndexOf('-') + 1)];
+        if (id.startsWith('vehicle') && s && group && info.index >= 0) {
+          const i = group.order[info.index];
           return {
-            text: `${VEHICLE_LABELS[VEHICLE_TYPES[s.type[i]]]} · ${PROFILE_LABELS[PROFILES[s.profile[i]]]}\n${(s.speed[i] * 3.6).toFixed(1)} km/h · lane ${s.lane[i] + 1}${s.flags[i] & 2 ? ' · filtering' : ''}${s.flags[i] & 4 ? ' · squeeze lane' : ''}${s.flags[i] & 8 ? ' · your cohort' : ''}`,
+            text: `${VEHICLE_LABELS[VEHICLE_TYPES[s.type[i]]]} · ${PROFILE_LABELS[PROFILES[s.profile[i]]]}\n${(s.speed[i] * 3.6).toFixed(1)} km/h · lane ${s.lane[i] + 1}${s.flags[i] & 2 ? ' · filtering' : ''}${s.flags[i] & 4 ? ' · squeeze lane' : ''}${s.flags[i] & 8 ? ' · your cohort' : ''}${s.cues[i] & CUE_BRAKE ? ' · braking' : ''}${s.cues[i] & CUE_RED_RUN ? ' · ran a red' : ''}`,
             style: { backgroundColor: '#18221c', color: '#edf4e9', fontSize: '12px' },
           };
         }
@@ -151,58 +159,58 @@ export default function MapCanvas({
         useUiStore.setState({ pinObstacle: false, panelOpen: true, mode: 'expert' });
       }
     });
-    const positionFrame = new SnapshotFrame();
-    let currentLayers: Layer[] = [];
-    let previous: Snapshot | null = null,
+    let scene: Scene | null = null,
+      previous: Snapshot | null = null,
       previousConfig: ScenarioConfig | null = null,
-      previousOptions = '';
+      previousOptions = '',
+      version = 0,
+      sceneVersion = 0,
+      drawn = '';
     function animate() {
       if (disposed) return;
+      frame = requestAnimationFrame(animate);
       const snapshot = snapshotRef.current,
         ui = useUiStore.getState(),
+        zoom = map.getZoom(),
         options = {
           colorMode: ui.colorMode,
           heat: ui.heat,
           queues: ui.queues,
-          zoom: Math.round(map.getZoom() * 10) / 10,
+          zoom: Math.round(zoom * 10) / 10,
         };
       const key = JSON.stringify(options);
       const now = performance.now();
-      if (snapshot !== previous && snapshot) positionFrame.accept(snapshot, now);
-      if (
-        snapshot !== previous ||
-        key !== previousOptions ||
-        configRef.current !== previousConfig
-      ) {
-        currentLayers = makeLayers(network, configRef.current, snapshot, options);
+      const fresh = snapshot !== previous;
+      if (fresh) {
+        if (snapshot) vehicles.accept(snapshot, now);
+        else vehicles.clear();
+        version++;
+      }
+      if (!scene || fresh || key !== previousOptions || configRef.current !== previousConfig) {
+        scene = sceneLayers(network, configRef.current, snapshot, options);
         previous = snapshot;
         previousConfig = configRef.current;
         previousOptions = key;
+        sceneVersion++;
       }
-      if (snapshot) {
-        const state = useSimStore.getState();
-        const positions = positionFrame.positions(
-          now,
-          state.speed,
-          state.status === 'running' && !state.skipping,
-        );
-        overlay.setProps({
-          layers: currentLayers.map((layer) => {
-            if (layer.id !== 'vehicles' && layer.id !== 'vehicle-icons') return layer;
-            const data = layer.props.data as {
-              length: number;
-              attributes: Record<string, { value: ArrayBufferView; size: number }>;
-            };
-            return layer.clone({
-              data: {
-                ...data,
-                attributes: { ...data.attributes, getPosition: { value: positions, size: 2 } },
-              },
-            });
-          }),
-        });
-      } else overlay.setProps({ layers: currentLayers });
-      frame = requestAnimationFrame(animate);
+      if (vehicles.paint(ui.colorMode)) version++;
+      const blinkOn = Math.floor(now / BLINK_MS) % 2 === 0;
+      // Skip redundant uploads once every vehicle has settled and nothing else changed.
+      const state = `${version}|${sceneVersion}|${blinkOn}|${vehicles.moving(now)}`;
+      if (state === drawn && !vehicles.moving(now)) return;
+      drawn = state;
+      const [ground, flyover] = snapshot ? vehicles.frame(now) : [];
+      groups.ground = ground;
+      groups.flyover = flyover;
+      overlay.setProps({
+        layers: [
+          ...scene.under,
+          ...(ground ? vehicleLayers(ground, 'ground', zoom, blinkOn, version) : []),
+          ...scene.deck,
+          ...(flyover ? vehicleLayers(flyover, 'flyover', zoom, blinkOn, version) : []),
+          ...scene.over,
+        ],
+      });
     }
     frame = requestAnimationFrame(animate);
     return () => {
@@ -312,6 +320,13 @@ export default function MapCanvas({
             <i className="cohort-ring" />
             Your cohort
           </span>
+          <span className="eyebrow">UP CLOSE</span>
+          {BEHAVIOUR_RINGS.map(([label, color]) => (
+            <span key={label}>
+              <i className="cohort-ring" style={{ borderColor: color }} />
+              {label}
+            </span>
+          ))}
         </div>
       )}
       <div className="map-credit">

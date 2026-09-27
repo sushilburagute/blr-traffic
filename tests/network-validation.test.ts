@@ -54,3 +54,32 @@ it('can replay wet pothole encounters deterministically', () => {
   expect(a.vehicles.obstacleMissed).toEqual(b.vehicles.obstacleMissed);
   expect(a.report()).toEqual(b.report());
 });
+it('main links, flyovers and ramps join without gaps (< 1 m)', async () => {
+  const { distance, projectSegment } = await import('@/sim/network');
+  const joints: string[] = [];
+  for (const s of network.segments) {
+    const next = network.segments.filter(
+      (n) => n.kind === 'main' && n.direction === s.direction && n.fromJunction === s.toJunction,
+    );
+    expect(next.length).toBeLessThanOrEqual(1);
+    if (s.kind === 'ramp') {
+      // A ramp ends on the centre of the kerb lane of the link it feeds.
+      const main = network.segments.find((m) => m.id === s.id.replace(/-ramp$/, ''))!;
+      const kerb = projectSegment(main, main.lanes - 1, 0);
+      expect(distance(s.polyline.at(-1)!, [kerb[0], kerb[1]])).toBeLessThan(0.5);
+      continue;
+    }
+    if (s.kind === 'flyover') {
+      // The bypass leaves the main carriageway at its split point.
+      const main = network.segments.find((m) => m.id === s.bypassFor)!;
+      const split = projectSegment(main, (main.lanes - 1) / 2, main.lengthM - s.lengthM);
+      expect(distance(s.polyline[0], [split[0], split[1]])).toBeLessThan(1);
+    }
+    if (next[0]) {
+      const gap = distance(s.polyline.at(-1)!, next[0].polyline[0]);
+      joints.push(`${s.id} -> ${next[0].id}: ${gap.toFixed(2)} m`);
+      expect(gap, `${s.id} -> ${next[0].id}`).toBeLessThan(1);
+    }
+  }
+  expect(joints.length).toBe(16);
+});

@@ -3,7 +3,8 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { createEngine } from '../src/sim/engine';
 import { presetConfig } from '../src/lib/presets';
 import { makeSnapshot } from '../src/sim/snapshot';
-import { makeLayers } from '../src/components/map/layers';
+import { sceneLayers, vehicleLayers } from '../src/components/map/layers';
+import { VehicleFrame } from '../src/components/map/vehicleFrame';
 import networkJSON from '../src/data/corridor/network.json';
 import type { NetworkData } from '../src/sim/types';
 const network = networkJSON as unknown as NetworkData;
@@ -45,11 +46,19 @@ for (let i = 0; i < 100; i++) {
   snapshot = makeSnapshot(engine, snapshot);
   snapTimes.push(performance.now() - start);
 }
-const layersTimes: number[] = [];
+const layersTimes: number[] = [],
+  frameTimes: number[] = [];
+const vehicles = new VehicleFrame(network);
 for (let i = 0; i < 100; i++) {
   const start = performance.now();
-  makeLayers(network, config, snapshot, { colorMode: 'type', heat: true, queues: true, zoom: 16 });
+  sceneLayers(network, config, snapshot, { colorMode: 'type', heat: true, queues: true, zoom: 16 });
+  vehicles.accept(snapshot, start);
+  vehicles.paint('type');
   layersTimes.push(performance.now() - start);
+  const frameStart = performance.now();
+  for (const [g, group] of vehicles.frame(frameStart + 25).entries())
+    vehicleLayers(group, g ? 'flyover' : 'ground', 16, true, i);
+  frameTimes.push(performance.now() - frameStart);
 }
 const summary = {
   node: process.version,
@@ -60,7 +69,8 @@ const summary = {
   stepP99Ms: sorted[Math.ceil(sorted.length * 0.99) - 1],
   snapshotMeanMs: snapTimes.slice(10).reduce((a, b) => a + b, 0) / 90,
   layerConstructionMeanMs: layersTimes.slice(10).reduce((a, b) => a + b, 0) / 90,
-  note: 'Synthetic 10k stationary two-wheelers spread across OSM main segments. Layer construction is CPU only; GPU frame time is not measured by this script.',
+  vehicleFrameMeanMs: frameTimes.slice(10).reduce((a, b) => a + b, 0) / 90,
+  note: 'Synthetic 10k stationary two-wheelers spread across OSM main segments. Layer construction (per snapshot) and vehicle frame interpolation (per animation frame) are CPU only; GPU frame time is not measured by this script.',
 };
 await mkdir('artifacts', { recursive: true });
 await writeFile('artifacts/perf.json', JSON.stringify(summary, null, 2));

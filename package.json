@@ -16,7 +16,9 @@
     "test:e2e": "playwright test",
     "data:fetch": "tsx scripts/fetch-corridor.ts",
     "data:build": "tsx scripts/build-network.ts",
+    "sprites:build": "tsx scripts/build-sprites.ts",
     "bench": "tsx scripts/bench.ts",
+    "trips": "tsx scripts/trip-times.ts",
     "format": "prettier --write ."
   },
   "dependencies": {

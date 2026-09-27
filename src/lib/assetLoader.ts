@@ -41,9 +41,13 @@ export async function loadAssets(
           await stylePromise;
         }
         if (i === 2) {
-          const r = await fetch('/sprites/vehicles.png', { signal });
-          if (!r.ok) throw new Error('Atlas unavailable');
-          await r.blob();
+          await Promise.all(
+            ['/sprites/vehicles.png', '/sprites/vehicle-details.png'].map(async (url) => {
+              const r = await fetch(url, { signal });
+              if (!r.ok) throw new Error('Atlas unavailable');
+              await r.blob();
+            }),
+          );
         }
         if (i === 3) {
           const client = createSimClient();

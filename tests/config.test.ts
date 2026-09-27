@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { defaults, mergeConfig, scenarioConfigSchema } from '@/lib/schema';
 import { presets, presetConfig } from '@/lib/presets';
+import LZString from 'lz-string';
 import { encode, decode } from '@/lib/share';
 describe('config and shares', () => {
   it('uses only route-safe characters even when compression produces plus signs', () => {
@@ -19,13 +20,23 @@ describe('config and shares', () => {
       expect(decode(code)).toEqual(c);
     });
   it('rejects invalid weights, versions, signal timing and malformed links', () => {
-    expect(() => mergeConfig(defaults(), { version: 2 as 1 })).toThrow();
+    expect(() => mergeConfig(defaults(), { version: 3 as 2 })).toThrow();
     expect(() => mergeConfig(defaults(), { demand: { vehPerHour: -1 } })).toThrow();
     expect(() =>
       mergeConfig(defaults(), { infra: { signals: { iblur: { cycleS: 100 } } } }),
     ).toThrow();
     expect(() => decode('!')).toThrow();
     expect(() => decode('a'.repeat(2000))).toThrow();
+  });
+  it('reads unversioned (v1) share links against the v1 defaults', () => {
+    const v1 = (patch: object) => LZString.compressToEncodedURIComponent(JSON.stringify(patch));
+    const plain = decode(v1({}));
+    expect(plain.version).toBe(2);
+    expect(plain.demand.vehPerHour).toBe(12000);
+    expect(plain.infra.speedLimitKmh).toBe(60);
+    expect(decode(v1({ demand: { vehPerHour: 9000 } })).demand.vehPerHour).toBe(9000);
+    expect(decode(v1({ version: 1 })).infra.speedLimitKmh).toBe(60);
+    expect(decode(encode(defaults()))).toEqual(defaults());
   });
   it('preserves nested siblings when patching', () => {
     const c = mergeConfig(defaults(), { environment: { rain: true } });

@@ -14,7 +14,7 @@ export const presets: Preset[] = [
     name: 'Monday 9 AM',
     tagline: 'The ORR, in its natural habitat.',
     icon: 'Sun',
-    tags: ['Rush hour', '12,000 veh/h'],
+    tags: ['Rush hour', '13,000 veh/h'],
     config: {},
   },
   {

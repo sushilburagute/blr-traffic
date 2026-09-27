@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import type { NetworkData, LonLat, Segment, Direction } from '../src/sim/types';
 import { JUNCTION_IDS } from '../src/sim/types';
-import { cumulative, distance } from '../src/sim/network/index';
+import { cumulative, distance, METRES_PER_DEGREE } from '../src/sim/network/index';
 import { defaultSignals } from '../src/lib/schema';
 // Junction centres on the ORR centreline, read off OSM (signal clusters / grade-separation midpoints):
 // Silk Board (Hosur Rd), Agara (Koramangala–Sarjapur Rd), Iblur (Sarjapur Rd), Bellandur (Bellandur Main Rd),
@@ -16,6 +16,9 @@ const anchors: LonLat[] = [
 ];
 /** Length of each grade-separated bypass: approach ramp + deck + exit ramp (ORR flyovers run 600–900 m). */
 const FLYOVER_M = 700;
+/** On-ramp geometry: length along the carriageway and how far outside the kerb lane it starts. */
+const RAMP_M = 30,
+  RAMP_SLEW_M = 6;
 const names = [
   'Central Silk Board',
   'Agara',
@@ -68,12 +71,22 @@ for (const way of ways) {
       graph.set(b, [...(graph.get(b) ?? []), { to: a, cost, way: way.id }]);
   }
 }
-function route(start: LonLat, end: LonLat): { polyline: LonLat[]; wayIds: number[] } | null {
+interface Route {
+  polyline: LonLat[];
+  wayIds: number[];
+  endNode: number;
+}
+/**
+ * Shortest directed path between two junction anchors. `from` pins the first node (the previous link's last
+ * node) so consecutive links of a carriageway share their joint instead of each snapping to its own
+ * "nearest node" to the anchor, which left a 41 m hole at Kadubeesanahalli.
+ */
+function route(start: LonLat, end: LonLat, from?: number): Route | null {
   const nearest = (point: LonLat) =>
     [...graph.keys()]
       .sort((a, b) => distance(point, nodes.get(a)!) - distance(point, nodes.get(b)!))
       .slice(0, 8);
-  const starts = nearest(start),
+  const starts = from !== undefined && graph.has(from) ? [from] : nearest(start),
     ends = nearest(end);
   if (!starts.length) return null;
   const costs = new Map<number, number>(),
@@ -124,7 +137,9 @@ function route(start: LonLat, end: LonLat): { polyline: LonLat[]; wayIds: number
     wayIds.add(p.way);
   }
   const polyline = path.map((id) => nodes.get(id)!);
-  return polyline.length > 1 ? { polyline, wayIds: [...wayIds].sort((a, b) => a - b) } : null;
+  return polyline.length > 1
+    ? { polyline, wayIds: [...wayIds].sort((a, b) => a - b), endNode: target }
+    : null;
 }
 const fallbackBends: LonLat[][] = [
   [
@@ -201,12 +216,18 @@ for (let i = 0; i < 6; i++) {
     ][i],
   });
 }
+/** Links are routed in travel order so each one can start exactly where the previous one ended. */
+const routed = new Map<string, { found: Route | null; polyline: LonLat[] }>();
 for (const direction of ['toMarathahalli', 'toSilkBoard'] as Direction[]) {
   const reverse = direction === 'toSilkBoard';
-  for (let i = 0; i < 5; i++) {
-    const from = reverse ? i + 1 : i,
+  let previous: { found: Route | null; polyline: LonLat[] } | undefined;
+  for (let k = 0; k < 5; k++) {
+    const i = reverse ? 4 - k : k,
+      from = reverse ? i + 1 : i,
       to = reverse ? i : i + 1;
-    const found = route(anchors[from], anchors[to]);
+    const found =
+      route(anchors[from], anchors[to], previous?.found?.endNode) ??
+      route(anchors[from], anchors[to]);
     if (!found) usedFallback = true;
     let polyline = found?.polyline ?? fallback(i, reverse);
     // Separate synthetic carriageway centrelines by 12 m; OSM paths retain their surveyed coordinates.
@@ -219,6 +240,21 @@ for (const direction of ['toMarathahalli', 'toSilkBoard'] as Direction[]) {
           m = Math.hypot(dx, dy) || 1;
         return [p[0] - ((dy / m) * 6) / 108300, p[1] + ((dx / m) * 6) / 111195];
       });
+    // Last resort (fallback geometry, or a pinned start the router could not use): bridge to the previous end.
+    const joint = previous?.polyline.at(-1);
+    if (joint && distance(joint, polyline[0]) > 0.01)
+      polyline =
+        distance(joint, polyline[0]) < 1 ? [joint, ...polyline.slice(1)] : [joint, ...polyline];
+    previous = { found, polyline };
+    routed.set(`${direction}-${i}`, previous);
+  }
+}
+for (const direction of ['toMarathahalli', 'toSilkBoard'] as Direction[]) {
+  const reverse = direction === 'toSilkBoard';
+  for (let i = 0; i < 5; i++) {
+    const from = reverse ? i + 1 : i,
+      to = reverse ? i : i + 1;
+    const { found, polyline } = routed.get(`${direction}-${i}`)!;
     const cumulativeS = cumulative(polyline);
     const segment: Segment = {
       id: `${direction}-${JUNCTION_IDS[from]}-${JUNCTION_IDS[to]}`,
@@ -273,8 +309,25 @@ for (const direction of ['toMarathahalli', 'toSilkBoard'] as Direction[]) {
       segmentId: segment.id,
       junctionId: JUNCTION_IDS[to],
     });
+    // Local traffic joins from the kerb side (left in left-hand traffic): the slip road runs in at a shallow
+    // angle and ends on the centre of the kerb lane, so its single lane lines up with the lane it feeds.
     const p = polyline[0],
-      rampLine: LonLat[] = [[p[0] - 0.0002, p[1] - 0.0002], p],
+      q = polyline[1],
+      cos = Math.cos((p[1] * Math.PI) / 180),
+      tx = (q[0] - p[0]) * cos,
+      ty = q[1] - p[1],
+      tm = Math.hypot(tx, ty) || 1,
+      ux = tx / tm,
+      uy = ty / tm,
+      // Unit normal pointing to the right of travel (positive lane offsets); the kerb is on the negative side.
+      nx = uy,
+      ny = -ux;
+    const kerbLane = -((segment.lanes - 1) / 2) * (segment.widthM / segment.lanes);
+    const at = (along: number, across: number): LonLat => [
+      p[0] + (ux * along + nx * across) / (METRES_PER_DEGREE * cos),
+      p[1] + (uy * along + ny * across) / METRES_PER_DEGREE,
+    ];
+    const rampLine: LonLat[] = [at(-RAMP_M, kerbLane - RAMP_SLEW_M), at(0, kerbLane)],
       rampS = cumulative(rampLine);
     network.segments.push({
       ...segment,

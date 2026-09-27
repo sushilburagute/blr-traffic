@@ -34,6 +34,17 @@ export class Vehicles {
   readonly gapHistory: Float32Array;
   readonly dvHistory: Float32Array;
   readonly previous: Float32Array;
+  /**
+   * Drawn lateral position, metres from the segment centreline (positive to the right of travel, like
+   * `laneOffset`). Relaxes toward the logical lane each step; rendering only — the model never reads it.
+   */
+  readonly latM: Float32Array;
+  /** Lateral velocity of `latM`, m/s (rendering only). */
+  readonly latV: Float32Array;
+  /** 1 once the driver has decided to cross this segment's stop line on amber/red (cleared on green / new segment). */
+  readonly committed: Uint8Array;
+  /** Sim time of the last red-light run (for the snapshot cue); very negative when none. */
+  readonly redRunAt: Float32Array;
   readonly active: number[] = [];
   readonly activeIndex: Int32Array;
   readonly lanePosition: Int32Array;
@@ -78,6 +89,10 @@ export class Vehicles {
     this.gapHistory = new Float32Array(capacity * 11);
     this.dvHistory = new Float32Array(capacity * 11);
     this.previous = new Float32Array(capacity);
+    this.latM = new Float32Array(capacity);
+    this.latV = new Float32Array(capacity);
+    this.committed = new Uint8Array(capacity);
+    this.redRunAt = new Float32Array(capacity);
     this.activeIndex = new Int32Array(capacity);
     this.lanePosition = new Int32Array(capacity);
     this.laneIndex = Array.from({ length: segmentCount * LANES_PER_SEGMENT }, () => []);
@@ -99,24 +114,25 @@ export class Vehicles {
     this.uid[id] = ++this.serial;
     this.spawnTime[id] = time;
     this.flags[id] = 0;
-    for (const field of [
-      this.s,
-      this.v,
-      this.a,
-      this.distance,
-      this.queueTime,
-      this.stops,
-      this.stopDuration,
-      this.laneChanges,
-      this.hardBrakes,
-      this.nearMisses,
-      this.filterEvents,
-      this.redRuns,
-      this.virtualTime,
-      this.cooldown,
-      this.dwellUntil,
-    ])
-      field[id] = 0;
+    this.s[id] = 0;
+    this.v[id] = 0;
+    this.a[id] = 0;
+    this.distance[id] = 0;
+    this.queueTime[id] = 0;
+    this.stops[id] = 0;
+    this.stopDuration[id] = 0;
+    this.laneChanges[id] = 0;
+    this.hardBrakes[id] = 0;
+    this.nearMisses[id] = 0;
+    this.filterEvents[id] = 0;
+    this.redRuns[id] = 0;
+    this.virtualTime[id] = 0;
+    this.cooldown[id] = 0;
+    this.dwellUntil[id] = 0;
+    this.latM[id] = NaN; // initialised to the lane centre by the engine (or on the first step)
+    this.latV[id] = 0;
+    this.committed[id] = 0;
+    this.redRunAt[id] = -1e9;
     this.servedStop[id] = -1;
     this.hasTurned[id] = 0;
     this.obstacleEncounter[id] = -1;
@@ -178,12 +194,11 @@ export class Vehicles {
       for (let i = 0; i < list.length; i++) this.lanePosition[list[i]] = i;
     }
   }
-  neighbours(
-    segment: number,
-    lane: number,
-    s: number,
-    exclude = -1,
-  ): { leader: number; follower: number } {
+  /** Result of the last `locate` call (kept in fields so the hot path allocates nothing). */
+  foundLeader = -1;
+  foundFollower = -1;
+  /** Finds the first vehicle at or ahead of `s` and the last one behind it in a lane list. */
+  locate(segment: number, lane: number, s: number, exclude = -1) {
     const list = this.laneIndex[segment * LANES_PER_SEGMENT + lane];
     let lo = 0,
       hi = list.length;
@@ -196,7 +211,17 @@ export class Vehicles {
       f = lo - 1;
     while (l < list.length && list[l] === exclude) l++;
     while (f >= 0 && list[f] === exclude) f--;
-    return { leader: list[l] ?? -1, follower: list[f] ?? -1 };
+    this.foundLeader = l < list.length ? list[l] : -1;
+    this.foundFollower = f >= 0 ? list[f] : -1;
+  }
+  neighbours(
+    segment: number,
+    lane: number,
+    s: number,
+    exclude = -1,
+  ): { leader: number; follower: number } {
+    this.locate(segment, lane, s, exclude);
+    return { leader: this.foundLeader, follower: this.foundFollower };
   }
   leader(id: number) {
     return this.laneIndex[this.laneKey(id)][this.lanePosition[id] + 1] ?? -1;
